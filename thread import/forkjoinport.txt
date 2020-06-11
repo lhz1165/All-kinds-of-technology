@@ -1,0 +1,338 @@
+package com.abmatrix.business.member.service.impl;
+
+
+import cn.hutool.core.util.IdUtil;
+import cn.hutool.poi.excel.ExcelUtil;
+import cn.hutool.poi.excel.ExcelWriter;
+import cn.hutool.poi.excel.StyleSet;
+import com.abmatrix.business.member.mapper.UmsMemberMapper;
+import com.abmatrix.business.member.po.UmsEcosystem;
+import com.abmatrix.business.member.service.EcologyAdminService;
+import com.abmatrix.business.member.service.IUmsEcosystemService;
+import com.abmatrix.business.member.service.IUmsMemberService;
+import com.abmatrix.business.member.service.IUmsRoleUserService;
+import com.abmatrix.component.common.enume.RealNameAuthState;
+import com.abmatrix.component.common.exception.MallBusinessException;
+import com.abmatrix.component.common.po.ums.UmsMember;
+import com.abmatrix.component.common.po.ums.UmsMemberExportVo;
+import com.abmatrix.component.common.po.ums.UmsRoleUser;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.apache.poi.ss.usermodel.Font;
+import org.springframework.beans.BeanUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import javax.annotation.Resource;
+import javax.servlet.ServletOutputStream;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+
+
+/**
+ * @author abm
+ */
+@Slf4j
+@Service
+public class UmsMemberServiceImpl extends ServiceImpl<UmsMemberMapper, UmsMember> implements IUmsMemberService {
+
+    @Resource
+    private IUmsRoleUserService umsRoleUserService;
+
+    @Resource
+    private IUmsEcosystemService iUmsEcosystemService;
+
+    @Resource
+    private EcologyAdminService ecologyAdminService;
+
+    @Autowired
+    private IUmsMemberService memberService;
+
+    @Override
+    public Optional<UmsMember> getByUsername(String username) {
+
+        return Optional.ofNullable(fillAuthorities(
+                lambdaQuery().eq(UmsMember::getUsername, username).one()));
+    }
+
+    private UmsMember fillAuthorities(UmsMember umsMember) {
+        if (umsMember != null) {
+            Set<String> authorities =
+                    umsRoleUserService.list(Wrappers.<UmsRoleUser>lambdaQuery()
+                            .eq(UmsRoleUser::getUserId, umsMember.getId()))
+                            .stream()
+                            .map(UmsRoleUser::getRole)
+                            .collect(Collectors.toSet());
+
+            authorities.add("LifeHouseLevel." + umsMember.getLifeHouseLevel().name());
+            authorities.add("StarPartnerLevel." + umsMember.getStarPartnerLevel().name());
+            authorities.add("RealNameAuthState." + umsMember.getRealNameAuthState().name());
+            authorities.add("HonoraryDirectorState." + umsMember.getHonoraryDirectorState().name());
+
+            umsMember.setAuth(authorities);
+        }
+        return umsMember;
+    }
+
+    @Override
+    public Optional<UmsMember> getByInviteCode(String inviteCode) {
+
+        return lambdaQuery().eq(UmsMember::getInviteCode, inviteCode).oneOpt();
+    }
+
+    @Override
+    public Optional<UmsMember> selectByIdForUpdate(Long id) {
+        return Optional.ofNullable(getBaseMapper().findByIdForUpdate(id));
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void exportMemberList(HttpServletResponse response) throws IOException {
+        long l = System.currentTimeMillis();
+        int count = memberService.lambdaQuery().count();
+        final int dealOnce = 100;
+        int totalPage = (int) Math.ceil((double) count / dealOnce);
+
+        log.info("导出用户, 总共 {} 页", totalPage);
+
+
+        try (ExcelWriter writer = ExcelUtil.getBigWriter()) {
+            //设置列属性
+            addHeaderExcelWriterAlias(writer);
+            setExcelWriterStyle(writer);
+            String title = "用户列表";
+            writer.merge(26, title);
+
+
+            List<UmsMemberExportVo> exportDataList = new CopyOnWriteArrayList<>();
+            List<UmsMember> memberList = memberService.list();
+            WorkFork workFork = new WorkFork(0, memberList.size(), memberList, memberService, iUmsEcosystemService, exportDataList);
+            workFork.invoke();
+
+            //设置内容
+            writer.write(exportDataList, true);
+            response.setContentType("application/vnd.ms-excel;charset=utf-8");
+            response.setHeader("Content-Disposition", "attachment;filename=user-" + IdUtil.fastSimpleUUID() + ".xls");
+            ServletOutputStream out = response.getOutputStream();
+            writer.flush(out, true);
+            System.out.println("多线程导出花费毫秒 " + (System.currentTimeMillis() - l));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * 设置属性行
+     *
+     * @param writer
+     */
+    private void addHeaderExcelWriterAlias(ExcelWriter writer) {
+        writer.addHeaderAlias("id", "用户id");
+        writer.addHeaderAlias("username", "用户名");
+        writer.addHeaderAlias("phone", "手机号码");
+        writer.addHeaderAlias("path", "推荐路径");
+        writer.addHeaderAlias("level", "所在层级");
+        writer.addHeaderAlias("lifeHouseLevel", "生活馆等级");
+        writer.addHeaderAlias("starPartnerLevel", "星级伙伴等级");
+        writer.addHeaderAlias("realNameAuthState", "实名认证状态");
+        writer.addHeaderAlias("idCardNumber", "身份证");
+        writer.addHeaderAlias("status", "帐号启用状态");
+        writer.addHeaderAlias("createTime", "创建时间");
+        writer.addHeaderAlias("inviteCode", "邀请码");
+        writer.addHeaderAlias("cnytBalance", "CNYT余额");
+        writer.addHeaderAlias("adBalance", "AD余额");
+        writer.addHeaderAlias("oystBalance", "OYST余额");
+        writer.addHeaderAlias("oystOptionBalance", "OYST期权余额");
+        writer.addHeaderAlias("bigAreaUserId", "大区用户Id");
+        writer.addHeaderAlias("bigAreaPerformance", "大区业绩");
+        writer.addHeaderAlias("yesterdayPerformance", "昨日社区业绩(包括自己)");
+        writer.addHeaderAlias("totalPerformance", "累计社区业绩");
+        writer.addHeaderAlias("ownPerformance", "自己的业绩");
+        writer.addHeaderAlias("adAccumulatedGains", "累计 ad 收益");
+        writer.addHeaderAlias("adYesterdayGains", "昨日 ad 收益");
+        writer.addHeaderAlias("cnytAccumulatedGains", "累计 cnyt 收益");
+        writer.addHeaderAlias("cnytYesterdayGains", "昨日 cnyt 收益");
+        writer.setOnlyAlias(true);
+    }
+
+    /**
+     * 设置excel样式
+     *
+     * @param writer
+     */
+    private void setExcelWriterStyle(ExcelWriter writer) {
+        StyleSet styleSet = writer.getStyleSet();
+        Font headFont = writer.createFont();
+        headFont.setBold(true);
+        headFont.setColor(Font.COLOR_RED);
+        headFont.setFontHeightInPoints((short) 13);
+        styleSet.getHeadCellStyle().setFont(headFont);
+        Font cellFont = writer.createFont();
+        cellFont.setBold(false);
+        cellFont.setColor(Font.COLOR_NORMAL);
+        cellFont.setFontHeightInPoints((short) 11);
+        styleSet.getCellStyle().setFont(cellFont);
+    }
+
+
+    private UmsMemberExportVo convertUmsMemberToUmsMemberExportVo(UmsMember member, Map<Long, UmsEcosystem> ecosystemMap) {
+
+        UmsMemberExportVo vo = new UmsMemberExportVo();
+        //配置member表属性
+        setExportVoOfMember(vo, member);
+        //配置ums_ecosystem表的属性
+        setEcosystemOfMember(vo, ecosystemMap.get(member.getId()));
+
+        return vo;
+    }
+
+    /**
+     * 配置member表属性
+     */
+    private void setExportVoOfMember(UmsMemberExportVo vo, UmsMember member) {
+        vo.setStatus(member.getStatus() == 1 ? "启用" : "禁用");
+        vo.setLifeHouseLevel(member.getLifeHouseLevel().getCnDescribe());
+        vo.setStarPartnerLevel(member.getStarPartnerLevel().getLevel() == 0 ? "普通用户" : member.getStarPartnerLevel().getLevel() + "星");
+        vo.setRealNameAuthState(getNameOfEnum(member.getRealNameAuthState()));
+        BeanUtils.copyProperties(member, vo);
+    }
+
+    private String getNameOfEnum(RealNameAuthState state) {
+        switch (state) {
+            case FAILED:
+                return "审核失败";
+            case PENDING:
+                return "审核中";
+            case SUCCESS:
+                return "认证成功";
+            case UNAUTHORIZED:
+                return "未认证";
+            default:
+                return "";
+        }
+    }
+
+
+    /**
+     * 配置ums_ecosystem表的属性
+     */
+    private void setEcosystemOfMember(UmsMemberExportVo vo, UmsEcosystem umsEcosystem) {
+        BeanUtils.copyProperties(umsEcosystem, vo, "id", "username");
+        vo.setTotalPerformance(umsEcosystem.calcRealPerformance());
+    }
+
+    class Worker implements Runnable {
+        int i;
+        IUmsMemberService memberService;
+        int dealOnce;
+        IUmsEcosystemService iUmsEcosystemService;
+        List<UmsMemberExportVo> exportDataList;
+        CountDownLatch latch;
+
+        public Worker(int i, IUmsMemberService memberService, int dealOnce, IUmsEcosystemService iUmsEcosystemService, List<UmsMemberExportVo> exportDataList, CountDownLatch latch) {
+            this.i = i;
+            this.memberService = memberService;
+            this.dealOnce = dealOnce;
+            this.iUmsEcosystemService = iUmsEcosystemService;
+            this.exportDataList = exportDataList;
+            this.latch = latch;
+        }
+
+        @Override
+        public void run() {
+            val memberList = memberService.lambdaQuery()
+                    .page(new Page<>(i, dealOnce))
+                    .getRecords();
+
+
+            val memberIds = memberList.stream()
+                    .map(UmsMember::getId)
+                    .collect(Collectors.toList());
+            if (!memberIds.isEmpty()) {
+                Map<Long, UmsEcosystem> ecosystemMap = iUmsEcosystemService.lambdaQuery()
+                        .in(UmsEcosystem::getUserId, memberIds)
+                        .list().stream()
+                        .collect(Collectors.toMap(UmsEcosystem::getUserId, one -> one));
+
+                if (memberIds.size() != ecosystemMap.entrySet().size()) {
+                    throw new MallBusinessException("查询数据有误, 请联系开发人员");
+                }
+
+                List<UmsMemberExportVo> voList = memberList.stream()
+                        .map(one -> convertUmsMemberToUmsMemberExportVo(one, ecosystemMap))
+                        .collect(Collectors.toList());
+
+                exportDataList.addAll(voList);
+                latch.countDown();
+            }
+        }
+    }
+
+    public class WorkFork extends RecursiveAction {
+        private Integer startNum;
+
+        private Integer endNum;
+
+        List<UmsMember> memberList;
+
+        IUmsMemberService memberService;
+
+        IUmsEcosystemService iUmsEcosystemService;
+        List<UmsMemberExportVo> exportDataList;
+
+        public WorkFork(Integer startNum, Integer endNum, List<UmsMember> memberList, IUmsMemberService memberService, IUmsEcosystemService iUmsEcosystemService, List<UmsMemberExportVo> exportDataList) {
+            this.startNum = startNum;
+            this.endNum = endNum;
+            this.memberList = memberList;
+            this.memberService = memberService;
+            this.iUmsEcosystemService = iUmsEcosystemService;
+            this.exportDataList = exportDataList;
+        }
+
+        @Override
+        protected void compute() {
+
+            if (endNum - startNum <= 150) {
+                List<UmsMember> memberList2 = memberList.subList(startNum, endNum);
+                val memberIds = memberList2.stream()
+                        .map(UmsMember::getId)
+                        .collect(Collectors.toList());
+                if (!memberIds.isEmpty()) {
+                    Map<Long, UmsEcosystem> ecosystemMap = iUmsEcosystemService.lambdaQuery()
+                            .in(UmsEcosystem::getUserId, memberIds)
+                            .list().stream()
+                            .collect(Collectors.toMap(UmsEcosystem::getUserId, one -> one));
+
+                    if (memberIds.size() != ecosystemMap.entrySet().size()) {
+                        throw new MallBusinessException("查询数据有误, 请联系开发人员");
+                    }
+
+                    List<UmsMemberExportVo> voList = memberList2.stream()
+                            .map(one -> convertUmsMemberToUmsMemberExportVo(one, ecosystemMap))
+                            .collect(Collectors.toList());
+
+                    exportDataList.addAll(voList);
+                }
+
+            } else {
+                WorkFork t1 = new WorkFork(startNum,(startNum+endNum)/2, this.memberList,memberService,iUmsEcosystemService,exportDataList);
+                WorkFork t2 = new WorkFork(((startNum+endNum)/2)+1,endNum, this.memberList,memberService,iUmsEcosystemService,exportDataList);
+                invokeAll(t1,t2);
+            }
+        }
+
+
+    }
+
+}
+
+
+
